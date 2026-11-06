@@ -1,0 +1,762 @@
+---
+title: "Simulating the 2026 MLB Postseason with Markov Chains"
+author: Hannah Smith, Henry Blaney, Ayan Shah, and Brendan Donegan
+date: "November 6, 2026"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-summary: "Show code"
+    embed-resources: true
+execute:
+  message: false
+  warning: false
+---
+
+```{r setup}
+#| include: false
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(readr)
+library(ggplot2)
+library(knitr)
+
+team_names <- c(
+  TB = "Rays", CLE = "Guardians", HOU = "Astros", NYY = "Yankees",
+  BOS = "Red Sox", CWS = "White Sox", MIL = "Brewers", LAD = "Dodgers",
+  ATL = "Braves", SD = "Padres", CHC = "Cubs", PHI = "Phillies"
+)
+pct <- function(x, d = 0) paste0(format(round(100 * x, d), nsmall = d), "%")
+```
+
+## Executive Summary
+
+Every October, twelve MLB teams enter the playoffs and only one wins the World Series. Regular season records set the seeding of the bracket and series with increasing length decide who advances. We wanted to know how well regular-season performance could estimate pennant and World Series chances and check those estimates against the 2026 Postseason that actually happened.
+
+We used publicly available 2026 pitch-by-pitch data for all twelve playoff teams: Rays, Guardians, Astros, Yankees, Red Sox, White Sox, Brewers, Dodgers, Braves, Padres, Cubs, and Phillies. Each half inning is tracked by base-out situations, such as nobody on and nobody out, first and second with one out, bases loaded with two outs, etc. From the season’s plate appearances, we estimate how often each club produces outs, walks, hits, and home runs, and how those situations typically move and produce runs. Pairing one team’s offense with the other team’s pitching gives a game win chance. We rolled that through a best of three, best of five, and best of seven series with patterns that typically occur with home and away field scenarios, then replay the full 2026 Postseason bracket 10,000 times starting with the initial seeding. Averaging those paths gives us each team’s pennant odds, World Series odds, and series by series win chances from the Wild Card Round, Division Series, Championship Series, and World Series.
+
+Across 10,000 simulated postseasons, World Series win odds were the highest for the Dodgers (32.3%), then Brewers (18.2%), then Rays (14.3%). Pennant odds favored the Dodgers in the National League (45.9%) and Rays in the American League (32.7%). The Brewers’ pennant chance was 28.8%. We compared the model’s series chances with the real 2026 postseason outcome: Wild Card wins by the White Sox, Yankees, Braves, and Padres; Division Series wins by the Guardians, Rays, Dodgers, and Brewers; Championship Series wins by the Rays and Brewers; and World Series win by the Brewers over the Rays. Of the eleven series played in the 2026 Postseason, the model’s favorite won in seven.
+
+Overall title odds are not the same as winning one series. In the Division Series, the model favored the Brewers over the Padres and the Dodgers over the Braves. In the NLCS, it gave the Brewers only a 40.6% chance to beat the Dodgers, so that Brewers win is an upset under the model. In the World Series, it gave the Brewers a 55.4% chance to beat the Rays, which is a slight favorite that matched the result. The Brewers still trailed the Dodgers in overall World Series title probability (18.2% vs. 32.3%) because winning the whole tournament is harder than winning one series.
+
+The model uses team-level rates rather than individual hitters or pitchers, learns mostly from innings one through eight (because the ninth can end before three outs), and treats each half inning as independent. Adding lineups, bullpens, parks, and late inning details would tighten the estimates.
+
+## 1. Introduction and Background
+
+#### 1.1 Motivation and research question
+
+Our group wanted to know what chance each team had of winning the 2026 Major League Baseball (MLB) championship before the playoffs began, and how well a purely statistical simulation could anticipate what actually happened. This project builds a simulation of the full 2026 postseason from team-level regular-season batting and pitching data, runs it 10,000 times, and then scores its predictions against the real results.
+
+Two questions guide the report:
+
+1.  **Forecasting:** Using only regular-season data, what were each postseason team's chances of winning its pennant (league championship) and the World Series?
+
+2.  **Evaluation:** How closely do the model's series-by-series probabilities match the 11 series actually played, as measured by the Brier score and by pick accuracy?
+
+#### 1.2 Baseball as a Markov Chain
+
+A half-inning of baseball is a natural fit for a Markov chain. At any moment the situation is described by two things: how many outs there are (0, 1, or 2) and which bases are occupied (each of three bases is either occupied or empty, giving 2 x 2 x 2 = 8 configurations). That gives 3 x 8 = 24 base-out states. The half-inning ends when the third out is recorded, which we treat as a 25th, absorbing state: once the chain enters it, it never leaves.
+
+The Markov property is the assumption that what happens next depends only on the current base-out state, not on how the batting team got there. Each plate appearance moves the chain from one state to another, and runs score during some of those moves. For example, a home run with a runner on first moves the game from "0 outs, runner on first" to "0 outs, bases empty" and scores two runs.
+
+Because the chain is absorbing, standard theory gives us exact answers. If Q is the 24 x 24 matrix of transition probabilities among the non-absorbing states, then the fundamental matrix N = (I − Q)^-1^ tells us the expected number of visits to every state before the half-inning ends. Multiplying N by the expected runs scored on a single step gives the expected runs to the end of the inning from any starting state. We use this quantity both to rate teams and as a building block for game probabilities.
+
+*Below is the code that numbers the 24 base-out states plus the absorbing state, labeled "Outs.BaseRunners"*
+
+```{r states}
+state_id <- function(outs, b1, b2, b3) outs * 8 + b1 + 2 * b2 + 4 * b3 + 1
+ABSORB <- 25
+state_label <- function(s) {
+  if (s == ABSORB) return("3.000")
+  s <- s - 1; outs <- s %/% 8; b <- s %% 8
+  paste0(outs, ".", as.integer(bitwAnd(b, 1) > 0),
+         as.integer(bitwAnd(b, 2) > 0), as.integer(bitwAnd(b, 4) > 0))
+}
+state_names <- sapply(1:25, state_label)
+```
+
+#### 1.3 The 2026 postseason format
+
+Twelve teams qualify, six from each league, seeded 1 through 6 by record within the league. The bracket used in our model is:
+
+| Round | Format | Matchups |
+|-------------------|----------------|-------------------------------------|
+| Wild Card | Best of 3 | Seed 3v6 and Seed 4v5 in each league |
+| Division Series (ALDS/NLDS) | Best of 5 | Seed 1 v winner of 4/5; Seed 2 v winner of 3/6 |
+| League Championship Series | Best of 7 | Two Division Series winners |
+| World Series | Best of 7 | Two League Champions |
+
+#### 1.4 Overview of our approach
+
+The pipeline has five stages:
+
+1.  Convert pitch-level Statcast data into one row per plate appearance, tagged with its starting base-out state.
+
+2.  Estimate how plate appearances advance runners and score runs (league-wide), and how often each team's offense and pitching staff produce each plate-appearance outcome (team-specific).
+
+3.  For any matchup, combine the batting team's offense with the opposing pitching staff into a 25 × 25 transition matrix.
+
+4.  Convert that matrix into an exact distribution of runs per half-inning, then into the probability that one team beats the other in a game.
+
+5.  Chain game probabilities into series and series into the full bracket, simulate 10,000 postseasons, and evaluate against the actual results.
+
+## 2. Data
+
+#### 2.1 Source
+
+The regular-season data come from Baseball Savant, MLB's public Statcast database (https://baseballsavant.mlb.com), which records every pitch thrown in MLB games. We downloaded all 2026 regular-season pitches between March 25 and September 28, 2026, in four-day windows to stay within the site's download limits, then combined and saved them as a single file. The real postseason results used for evaluation were taken from MLB.com's and CBS Sports' postseason bracket pages (linked in the code).
+
+*Below is the code that downloads the Statcast regular season data. It is shown for reproducibility but not re-run when this report renders; the report reads the saved file instead.*
+
+```{r pull-data}
+#| eval: false
+season_start <- as.Date("2026-03-25")
+season_end   <- as.Date("2026-09-28")
+
+keep_cols <- c("game_pk", "game_date", "game_type", "at_bat_number",
+               "pitch_number", "inning", "inning_topbot", "outs_when_up",
+               "on_1b", "on_2b", "on_3b", "events", "bat_score",
+               "post_bat_score", "home_team", "away_team")
+
+savant_url <- function(s, e) {
+  paste0("https://baseballsavant.mlb.com/statcast_search/csv?all=true",
+         "&hfGT=R%7C&hfSea=2026%7C&player_type=batter",
+         "&game_date_gt=", s, "&game_date_lt=", e,
+         "&min_pitches=0&min_results=0&group_by=name&sort_col=pitches",
+         "&sort_order=desc&min_abs=0&type=details")
+}
+
+dir.create("data", showWarnings = FALSE)
+for (s in as.list(seq(season_start, season_end, by = 4))) {
+  e <- min(s + 3, season_end)
+  f <- sprintf("data/statcast_%s.rds", s)
+  if (file.exists(f)) next
+  tmp <- tempfile(fileext = ".csv")
+  download.file(savant_url(s, e), tmp, quiet = TRUE, mode = "wb")
+  read_csv(tmp, show_col_types = FALSE, guess_max = 100000) |>
+    select(all_of(keep_cols)) |>
+    mutate(game_date = as.Date(game_date),
+           across(c(on_1b, on_2b, on_3b), as.numeric),
+           across(c(game_type, inning_topbot, events, home_team, away_team),
+                  as.character)) |>
+    saveRDS(f)
+  Sys.sleep(2)
+}
+
+sc <- list.files("data", pattern = "^statcast_.*\\.rds$", full.names = TRUE) |>
+  map(readRDS) |> bind_rows() |>
+  filter(game_type == "R") |> distinct()
+saveRDS(sc, "data/statcast_2026_regular.rds")
+```
+
+```{r load-data}
+data_file <- "data/statcast_2026_regular.rds"
+if (!file.exists(data_file)) {
+  stop("Data file not found. Put this .qmd in the same folder as the 'data' folder, ",
+       "or run the download code above first.")
+}
+sc <- readRDS(data_file)
+```
+
+#### 2.2 What a row represents
+
+The raw file has one row per pitch. The table we actually analyze, after the transformations below, has one row per plate appearance: one batter's complete turn at the plate against one pitcher, from the first pitch to the event that ended it (a strikeout, walk, hit, out in play, and so on). Each row records the game, inning, which team was batting and pitching, the outs and baserunners when the plate appearance began, the type of outcome, the base-out state that followed, and the number of runs scored.
+
+#### 2.3 Transformations
+
+1.  **Kept only needed columns and regular-season games.** Of the dozens of fields Statcast provides, we kept 16 (game and date identifiers, inning, outs, runners on base, the event, the score before and after, and the two teams), restricted to regular-season games (not spring training or postseason), and removed duplicate rows.
+
+2.  **Collapsed pitches into plate appearances.** For each plate appearance, the starting situation (outs and baserunners) comes from its first pitch, and the final event and ending score come from its last pitch.
+
+3.  **Determined batting and pitching team.** In the top half of an inning the visiting team bats, and in the bottom half the home team bats.
+
+4.  **Labeled each start and end state.** Each plate appearance's starting state is one of the 24 base-out combinations. Its ending state is the starting state of the next plate appearance in the same half-inning, or the absorbing three-out state if it was the last. Runs scored are the change in the batting team's score between the two.
+
+5.  **Grouped outcomes into eight categories** (described in Section 3.1).
+
+*Below is the code that classifies the eight outcomes of a plate appearance (see Section 3.1)*
+
+```{r classify}
+OUTCOMES <- c("OUT", "K", "BB", "1B", "2B", "3B", "HR", "E")
+classify_event <- function(ev) {
+  case_when(
+    ev %in% c("strikeout", "strikeout_double_play")                     ~ "K",
+    ev %in% c("walk", "intent_walk", "hit_by_pitch", "catcher_interf")  ~ "BB",
+    ev == "single"   ~ "1B",
+    ev == "double"   ~ "2B",
+    ev == "triple"   ~ "3B",
+    ev == "home_run" ~ "HR",
+    ev == "field_error" ~ "E",
+    ev %in% c("field_out", "force_out", "grounded_into_double_play",
+              "double_play", "triple_play", "fielders_choice",
+              "fielders_choice_out", "sac_fly", "sac_bunt",
+              "sac_fly_double_play", "sac_bunt_double_play")             ~ "OUT",
+    TRUE ~ NA_character_
+  )
+}
+```
+
+*Below is the code which collapses pitches into plate appearances*
+
+```{r build-pa}
+pa_all <- sc |>
+  group_by(game_pk, at_bat_number) |>
+  summarise(
+    inning       = first(inning),
+    half         = first(inning_topbot),
+    home_team    = first(home_team),
+    away_team    = first(away_team),
+    outs_start   = outs_when_up[which.min(pitch_number)],
+    b1           = as.integer(!is.na(on_1b[which.min(pitch_number)])),
+    b2           = as.integer(!is.na(on_2b[which.min(pitch_number)])),
+    b3           = as.integer(!is.na(on_3b[which.min(pitch_number)])),
+    score_start  = bat_score[which.min(pitch_number)],
+    score_end_pa = post_bat_score[which.max(pitch_number)],
+    event        = events[which.max(pitch_number)],
+    .groups = "drop"
+  ) |>
+  mutate(
+    outcome  = classify_event(event),
+    bat_team = if_else(half == "Top", away_team, home_team),
+    pit_team = if_else(half == "Top", home_team, away_team),
+    s_start  = state_id(outs_start, b1, b2, b3)
+  ) |>
+  arrange(game_pk, at_bat_number) |>
+  group_by(game_pk, inning, half) |>
+  mutate(
+    last_in_half = row_number() == n(),
+    s_next = if_else(last_in_half, ABSORB, lead(s_start)),
+    runs   = if_else(last_in_half, score_end_pa - score_start,
+                     lead(score_start) - score_start)
+  ) |>
+  ungroup()
+```
+
+#### 2.4 Inclusion and exclusion criteria
+
+-   **Season and game type:** 2026 regular season only. No postseason data are used to fit the model since we are trying to predict the postseason.
+
+-   **Teams:** The data cover all 30 teams, and league-wide averages are computed across all of them. Team-specific estimates are then used for the 12 playoff teams.
+
+-   **Innings:** Only innings 1 through 8 are used. The ninth inning and extra innings can end before three outs (for instance, a walk-off), which would break the "every inning ends at three outs" structure of the chain.
+
+-   **Outcomes and runs:** Plate appearances with an unusual or unclassifiable ending (for example, certain rare event codes) are dropped. We also drop plate appearances in which a negative run total appears (a bookkeeping artifact) or more than four runs score (a grand slam is the maximum from a single plate appearance, so larger totals indicate data errors).
+
+```{r filter-pa}
+pa <- pa_all |> filter(inning < 9, !is.na(outcome), runs >= 0, runs <= 4)
+```
+
+After these steps the analysis table has `r format(nrow(pa), big.mark = ",")` plate appearances.
+
+#### 2.5 Key variables
+
+| Concept | Meaning | Units / Range |
+|-------------------|---------------------------|---------------------------|
+| Base-out state | Number of outs and which bases are occupied at the start of a plate appearance | 24 combinations, plus a 25th for "three outs" |
+| Plate-appearance outcome | What the plate appearance produced: out, strikeout, walk (including hit-by-pitch and intentional walks), single, double, triple, home run, or reaching on an error | 8 categories |
+| Runs on a play | Runs the batting team scored during one plate appearance | 0 to 4 |
+| Team offensive rates | Share of a team's plate appearances ending in each outcome | proportions that sum to 1 |
+| Team pitching rates | Share of plate appearances against a staff that end in each outcome | proportions that sum to 1 |
+| Regular-season wins | Used for seeding and to decide home-field advantage in the World Series | games out of 162 |
+
+## 3. Methods
+
+#### 3.1 Classifying plate-appearance outcomes
+
+Statcast uses dozens of event labels. We reduced them to eight: OUT (ordinary outs, force outs, double plays, sacrifices, and fielder's choices), K (strikeouts), BB (walks, intentional walks, hit-by-pitch, and catcher's interference, all of which put the batter on base without a hit), 1B, 2B, 3B, HR, and E (reached on an error). Grouping outcomes keeps each category large enough to estimate reliably. The classification code appears in Section 2.3, where it is first used.
+
+#### 3.2 Advancement probabilities (league-wide)
+
+Knowing the outcome of a plate appearance does not fully determine what happens to the runners. A single with a runner on second sometimes scores that runner and sometimes does not. For every combination of starting state and outcome, we measured from the 2026 data how often each next state and run total occurred. These league-wide probabilities answer the question, "given a single with runners on first and second and one out, where do the runners end up and how many runs score?"
+
+Some combinations are never observed (for example, a triple with the bases loaded and no outs may simply not occur often enough). For those, we fall back on a deterministic rule that applies standard baseball logic: outs add an out, a walk forces runners along only when needed, a single advances runners by a fixed rule, and a home run clears the bases and scores everyone. The code keeps a count of how many combinations used this rule.
+
+An important design choice is that advancement behavior is shared across all teams. Teams differ in how often each outcome happens, not in how runners move once it does. This is a simplification of our proposal, which called for team-specific transition matrices. It is far more statistically stable, because splitting the data by team and state and outcome would leave most cells nearly empty.
+
+*Below are the league-wide advancement probabilities and the fallback rule for unobserved combinations in 2026*
+
+```{r advancement}
+MAXR <- 4
+adv <- pa |>
+  count(s_start, outcome, s_next, runs, name = "n") |>
+  group_by(s_start, outcome) |>
+  mutate(p = n / sum(n)) |>
+  ungroup()
+
+adv_arr <- array(0, dim = c(24, length(OUTCOMES), 25, MAXR + 1),
+                 dimnames = list(NULL, OUTCOMES, NULL, 0:MAXR))
+for (i in seq_len(nrow(adv))) {
+  r <- adv[i, ]
+  adv_arr[r$s_start, r$outcome, r$s_next, r$runs + 1] <- r$p
+}
+
+# rule for any (state, outcome) pair never observed in 2026
+fallback <- function(s, k) {
+  s0 <- s - 1; outs <- s0 %/% 8; b <- s0 %% 8
+  r1 <- bitwAnd(b, 1) > 0; r2 <- bitwAnd(b, 2) > 0; r3 <- bitwAnd(b, 4) > 0
+  runners <- r1 + r2 + r3
+  res <- switch(k,
+    "OUT" = , "K" = list(outs = outs + 1, b = b, runs = 0),
+    "BB"  = , "E" = list(outs = outs, b = 1 + 2 * (r2 | r1) + 4 * (r3 | (r2 & r1)),
+                         runs = as.integer(r1 & r2 & r3)),
+    "1B" = list(outs = outs, b = 1 + 4 * r1, runs = r2 + r3),
+    "2B" = list(outs = outs, b = 2 + 4 * r1, runs = r2 + r3),
+    "3B" = list(outs = outs, b = 4, runs = runners),
+    "HR" = list(outs = outs, b = 0, runs = runners + 1)
+  )
+  s_next <- if (res$outs >= 3) ABSORB else res$outs * 8 + res$b + 1
+  c(s_next = s_next, runs = min(if (res$outs >= 3) 0 else res$runs, MAXR))
+}
+n_filled <- 0
+for (s in 1:24) for (k in OUTCOMES) {
+  if (sum(adv_arr[s, k, , ]) == 0) {
+    fb <- fallback(s, k)
+    adv_arr[s, k, fb["s_next"], fb["runs"] + 1] <- 1
+    n_filled <- n_filled + 1
+  }
+}
+```
+
+In the 2026 data, `r n_filled` of the 192 state-outcome combinations (24 states × 8 outcomes) were never observed and used the fallback rule.
+
+#### 3.3 Team outcome rates with shrinkage
+
+For every team we computed two sets of eight outcome rates: one for its offense (what happens when it bats) and one for its pitching (what happens when opponents bat against it). A raw rate from a limited sample can be misleading, so we applied shrinkage toward the league average. If a team had n plate appearances with a given outcome out of N total, and the league rate for that outcome is p, the adjusted rate is: **adjusted rate = (n + 200 x p) / (N + 200)**
+
+In effect, we blend in 200 "pseudo-plate-appearances" of league-average performance. Because a full season has thousands of plate appearances per team, the shrinkage is mild, but it pulls extreme values slightly toward the middle and guarantees that no outcome has a rate of exactly zero. The value 200 is a fixed setting and was not tuned.
+
+```{r team-rates}
+M <- 200
+league_rates <- pa |> count(outcome) |> mutate(p = n / sum(n))
+p_lg <- setNames(league_rates$p, league_rates$outcome)[OUTCOMES]
+
+team_rates <- function(side_col) {
+  pa |>
+    count(team = .data[[side_col]], outcome) |>
+    complete(team, outcome = OUTCOMES, fill = list(n = 0)) |>
+    group_by(team) |>
+    mutate(p = (n + M * p_lg[outcome]) / (sum(n) + M)) |>
+    ungroup() |>
+    select(team, outcome, p) |>
+    pivot_wider(names_from = outcome, values_from = p) |>
+    select(team, all_of(OUTCOMES))
+}
+off_rates <- team_rates("bat_team")
+pit_rates <- team_rates("pit_team")
+
+# "LG" = a league-average team, used for ratings
+get_rates <- function(tbl, tm) {
+  if (tm == "LG") return(p_lg)
+  row <- tbl[tbl$team == tm, OUTCOMES]
+  if (nrow(row) == 0) stop("Team code not found: ", tm)
+  unlist(row)
+}
+```
+
+#### 3.4 Combining a batting team with a pitching team
+
+For a matchup in which team A bats against team B's pitching, the outcome probabilities should reflect both. We use the odds-ratio (log5-style) combination: for each outcome, multiply team A's offensive rate by team B's pitching rate, divide by the league rate, and then rescale the eight values so they sum to 1. Intuitively, if A's offense hits home runs at twice the league rate and B's pitchers allow home runs at half the league rate, the two effects roughly cancel. A league-average team (labeled "LG") is also available so that a team can be rated against a typical opponent.
+
+*Below is the odds-ratio combination of one team's offense with another team's pitching*
+
+```{r matchup}
+matchup_rates <- function(bat_team, pit_team) {
+  raw <- get_rates(off_rates, bat_team) * get_rates(pit_rates, pit_team) / p_lg
+  raw / sum(raw)
+}
+```
+
+#### 3.5 Matchup transition matrix and run expectancy
+
+For a given matchup, the probability of moving from one state to another is the sum, over the eight outcomes, of (probability of that outcome) x (probability the runners advance to that state, given the outcome). This builds the 25 x 25 transition matrix, with the absorbing state fixed so that it transitions only to itself.
+
+From the 24 x 24 block Q of non-absorbing transitions and the expected runs scored on each step, we compute expected runs to the end of the inning using N = (I − Q)^-1^. Starting from "0 outs, bases empty" and multiplying by 9 gives each team's expected runs per nine innings against a league-average opponent, both when batting and when pitching.
+
+*Below is the 25 x 25 transition matrix for a matchup, and expected runs to the end of the inning from each respective state*
+
+```{r chain}
+transition_matrix <- function(bat_team, pit_team) {
+  pk <- matchup_rates(bat_team, pit_team)
+  P  <- matrix(0, 25, 25)
+  for (k in OUTCOMES) {
+    P[1:24, ] <- P[1:24, ] + pk[k] * apply(adv_arr[, k, , ], c(1, 2), sum)
+  }
+  P[ABSORB, ABSORB] <- 1
+  dimnames(P) <- list(state_names, state_names)
+  P
+}
+
+# Expected runs to the end of the half-inning via N = (I - Q)^{-1}
+expected_runs <- function(bat_team, pit_team) {
+  pk <- matchup_rates(bat_team, pit_team)
+  Q  <- matrix(0, 24, 24); rvec <- numeric(24)
+  for (k in OUTCOMES) {
+    a <- adv_arr[, k, , ]
+    Q    <- Q + pk[k] * apply(a[, 1:24, ], c(1, 2), sum)
+    rvec <- rvec + pk[k] * apply(a, 1, \(m) sum(m %*% (0:MAXR)))
+  }
+  N <- solve(diag(24) - Q)
+  setNames(as.vector(N %*% rvec), state_names[1:24])
+}
+```
+
+#### 3.6 Exact distribution of runs per half-inning
+
+Winning a game depends on the distribution of runs in an inning, not only its average. A team that scores in occasional big bursts has a different win probability than one that scores steadily, even with the same average. We compute the exact distribution by tracking the probability of being in each state with each running run total, and stepping the chain forward one plate appearance at a time until essentially all probability has reached the absorbing state (less than one in ten billion remains). Run totals above 15 in a single half-inning are grouped into one top category, which has negligible probability.
+
+```{r inning-dist}
+MAX_INN_RUNS <- 15
+inning_run_dist <- function(bat_team, pit_team, tol = 1e-10, max_pa = 60) {
+  pk <- matchup_rates(bat_team, pit_team)
+  A  <- Reduce(`+`, lapply(OUTCOMES, \(k) pk[k] * adv_arr[, k, , ]))
+  cur <- matrix(0, 24, MAX_INN_RUNS + 1); cur[1, 1] <- 1
+  done <- numeric(MAX_INN_RUNS + 1)
+  for (step in 1:max_pa) {
+    nxt <- matrix(0, 24, MAX_INN_RUNS + 1)
+    for (r in 0:MAXR) {
+      shift <- cbind(matrix(0, 24, r), cur)[, 1:(MAX_INN_RUNS + 1), drop = FALSE]
+      if (r > 0) shift[, MAX_INN_RUNS + 1] <- shift[, MAX_INN_RUNS + 1] +
+        rowSums(cur[, (MAX_INN_RUNS + 2 - r):(MAX_INN_RUNS + 1), drop = FALSE])
+      nxt  <- nxt  + t(A[, 1:24, r + 1]) %*% shift
+      done <- done + as.vector(t(A[, ABSORB, r + 1]) %*% shift)
+    }
+    cur <- nxt
+    if (sum(cur) < tol) break
+  }
+  done / sum(done)
+}
+```
+
+#### 3.7 Win probability for a single game
+
+To get the probability that the home team beats the away team, we:
+
+1.  Treat each of the nine innings as an independent draw from the team's half-inning run distribution, and combine nine of them to get each team's nine-inning run total distribution.
+
+2.  Compute the probability that the home team's total is strictly higher after nine innings.
+
+3.  For ties, compute the probability that a single extra inning is decided in the home team's favor versus ending tied again, and resolve the tie using the repeating-inning formula P(home wins extras) = P(win one extra inning) / (1 − P(tie one extra inning)). The model does not use an automatic runner on second base in extra innings.
+
+The result is an exact game probability with no random sampling. Because many pairs of teams appear repeatedly in a bracket, results are stored so each matchup is computed only once.
+
+*Below is the code in which nine innings are combined by convolutions, ties are resolved with the repeating extra-inning formula, and results are cached*
+
+```{r game-wp}
+convolve_n <- function(d, n) {
+  out <- 1
+  for (i in seq_len(n)) out <- convolve(out, rev(d), type = "open")
+  pmax(out, 0)
+}
+
+# P(home team wins): 9 innings, then extra innings (no automatic runner)
+game_win_prob <- function(home, away) {
+  d_home <- inning_run_dist(home, away)
+  d_away <- inning_run_dist(away, home)
+  h9 <- convolve_n(d_home, 9); a9 <- convolve_n(d_away, 9)
+  L  <- max(length(h9), length(a9))
+  h9 <- c(h9, rep(0, L - length(h9))); a9 <- c(a9, rep(0, L - length(a9)))
+  p_home_ahead <- sum(h9[-1] * cumsum(a9)[-L])
+  p_tie        <- sum(h9 * a9)
+  la <- length(d_away); cda <- cumsum(d_away)
+  x_win <- sum(d_home[-1] * cda[pmin(seq_along(d_home)[-1] - 1, la)])
+  m <- seq_len(min(length(d_home), la))
+  x_tie <- sum(d_home[m] * d_away[m])
+  p_home_ahead + p_tie * x_win / (1 - x_tie)
+}
+
+wp_cache <- new.env()
+win_prob <- function(home, away) {
+  key <- paste(home, away)
+  if (is.null(wp_cache[[key]])) wp_cache[[key]] <- game_win_prob(home, away)
+  wp_cache[[key]]
+}
+```
+
+#### 3.8 Checking the exact calculation by simulation
+
+To verify that the exact calculation is correct, we simulated 10,000 individual games of the Dodgers (home) against the Brewers by drawing from the transition matrix state by state, playing out each half-inning, and counting runs from the change in outs and base runners. We then compared the fraction won in simulation with the exact win probability. Agreement between the two gives confidence in both the transition matrix and the convolution logic.
+
+```{r sim-check}
+# sample states until "3.000"; count runs with
+# runs = (O + B + 1) - (O* + B*)
+n_outs    <- setNames(c(rep(0:2, each = 8), 3), state_names)
+n_runners <- setNames(c(rep(c(0, 1, 1, 2, 1, 2, 2, 3), 3), 0), state_names)
+
+simulate_half_inning <- function(P) {
+  state <- "0.000"; runs <- 0; iter <- 0
+  while (state != "3.000" && iter < 30) {
+    next_state <- sample(x = state_names, size = 1, replace = TRUE, prob = P[state, ])
+    if (next_state != "3.000") {
+      runs <- runs + (n_outs[state] + n_runners[state] + 1) -
+                     (n_outs[next_state] + n_runners[next_state])
+    }
+    state <- next_state; iter <- iter + 1
+  }
+  unname(runs)
+}
+
+simulate_game <- function(P_home, P_away) {
+  home <- 0; away <- 0; inning <- 0
+  while (inning < 9 || (home == away && inning < 20)) {
+    inning <- inning + 1
+    away <- away + simulate_half_inning(P_away)
+    home <- home + simulate_half_inning(P_home)
+  }
+  home > away
+}
+
+sim_check <- function(home, away, n_sims = 10000) {
+  P_home <- transition_matrix(home, away)
+  P_away <- transition_matrix(away, home)
+  home_wins <- numeric(n_sims)
+  for (r in 1:n_sims) {
+    set.seed(479 + r)
+    home_wins[r] <- simulate_game(P_home, P_away)
+  }
+  c(simulated = mean(home_wins), exact = game_win_prob(home, away))
+}
+
+check <- sim_check("LAD", "MIL", n_sims = 10000)
+```
+
+The simulated Dodgers home win rate was `r pct(check[["simulated"]], 1)`, compared with an exact probability of `r pct(check[["exact"]], 1)`.
+
+#### 3.9 Series and bracket simulation
+
+A series is played game by game with the correct home-field pattern. In each game, the higher seed's win probability is the exact game probability above, from the home or away perspective as appropriate. The series ends when one team reaches the required number of wins (2 of 3, 3 of 5, or 4 of 7). For evaluation, a recursive calculation gives the exact probability that the higher seed wins any series, which we call the series probability.
+
+The full postseason is then simulated 10,000 times:
+
+1.  Play both leagues' Wild Card, Division, and Championship series using the bracket structure in Section 1.3.
+
+2.  Match the two pennant winners in the World Series, with home field going to the team with more regular-season wins.
+
+3.  Record which teams reached the World Series and which won it.
+
+The fraction of simulations in which each team wins its pennant or the title is its simulated probability. Random seeds are fixed so that the results are reproducible.
+
+Note that the simulation draws game outcomes from the exact win probabilities; it does not replay every half-inning of every game. This makes 10,000 full postseasons computationally feasible while keeping the baseball model underneath.
+
+*Below are the seeds, the home-field patterns, a simulated series, the exact series probability, and the league bracket*
+
+```{r bracket}
+AL <- c("TB", "CLE", "HOU", "NYY", "BOS", "CWS")   # seeds 1-6
+NL <- c("MIL", "LAD", "ATL", "SD", "CHC", "PHI")   # seeds 1-6
+wins_2026 <- c(TB = 98, CLE = 85, HOU = 81, NYY = 93, BOS = 87, CWS = 84,
+               MIL = 103, LAD = 100, ATL = 94, SD = 91, CHC = 89, PHI = 88)
+
+# Home-field pattern from the higher seed's perspective
+patterns <- list(`3` = c(TRUE, TRUE, TRUE),
+                 `5` = c(TRUE, TRUE, FALSE, FALSE, TRUE),
+                 `7` = c(TRUE, TRUE, FALSE, FALSE, FALSE, TRUE, TRUE))
+
+play_series <- function(high, low, best_of) {
+  need <- best_of %/% 2 + 1; w_h <- 0; w_l <- 0
+  for (home_is_high in patterns[[as.character(best_of)]]) {
+    p_high <- if (home_is_high) win_prob(high, low) else 1 - win_prob(low, high)
+    if (runif(1) < p_high) w_h <- w_h + 1 else w_l <- w_l + 1
+    if (w_h == need) return(high)
+    if (w_l == need) return(low)
+  }
+}
+
+series_prob <- function(high, low, best_of) {
+  need <- best_of %/% 2 + 1; pat <- patterns[[as.character(best_of)]]
+  p <- ifelse(pat, win_prob(high, low), 1 - win_prob(low, high))
+  f <- function(g, wh, wl) {
+    if (wh == need) return(1); if (wl == need) return(0)
+    p[g] * f(g + 1, wh + 1, wl) + (1 - p[g]) * f(g + 1, wh, wl + 1)
+  }
+  f(1, 0, 0)
+}
+
+play_league <- function(lg) {
+  wc1 <- play_series(lg[3], lg[6], 3)
+  wc2 <- play_series(lg[4], lg[5], 3)
+  ds1 <- play_series(lg[1], wc2, 5)
+  ds2 <- play_series(lg[2], wc1, 5)
+  hi  <- if (match(ds1, lg) < match(ds2, lg)) ds1 else ds2
+  lo  <- if (hi == ds1) ds2 else ds1
+  list(pennant = play_series(hi, lo, 7))
+}
+
+simulate_postseason <- function(n_sims = 10000) {
+  res <- replicate(n_sims, {
+    a <- play_league(AL)$pennant; n <- play_league(NL)$pennant
+    hi <- if (wins_2026[a] >= wins_2026[n]) a else n
+    lo <- if (hi == a) n else a
+    c(champ = play_series(hi, lo, 7), al = a, nl = n)
+  })
+  teams <- c(AL, NL)
+  tibble(
+    team      = teams,
+    league    = rep(c("AL", "NL"), each = 6),
+    seed      = rep(1:6, 2),
+    p_pennant = sapply(teams, \(t) mean(res["al", ] == t | res["nl", ] == t)),
+    p_title   = sapply(teams, \(t) mean(res["champ", ] == t))
+  ) |> arrange(desc(p_title))
+}
+```
+
+*Below are 10,000 simulated postseasons*
+
+```{r simulate}
+set.seed(441)
+N_SIMS <- 10000
+results <- simulate_postseason(N_SIMS)
+```
+
+#### 3.10 Evaluation metrics
+
+We score the model against the 11 series that were actually played, using each series' actual matchup (given who really played whom, how well did the model call the winner?).
+
+-   Brier score: the average of the squared difference between the predicted probability that the higher seed wins and what happened (1 if it won, 0 if not). Lower is better. A model that always says 50/50 scores 0.25, so any useful model should beat that. A perfectly confident correct model would score 0.
+
+-   Pick accuracy: the number of series in which the team the model favored (probability above 50%) actually won.
+
+-   Log loss: also reported. It penalizes confident wrong predictions more heavily than the Brier score does.
+
+```{r evaluate}
+# https://www.mlb.com/news/mlb-playoff-picture-and-bracket-2026
+# https://www.cbssports.com/mlb/news/2026-mlb-playoff-picture-standings-bracket/
+
+actual <- tribble(
+  ~round,  ~high_seed, ~low_seed, ~best_of, ~winner,
+  "AL Wild Card", "HOU", "CWS", 3, "CWS",
+  "AL Wild Card", "NYY", "BOS", 3, "NYY",
+  "NL Wild Card", "ATL", "PHI", 3, "ATL",
+  "NL Wild Card", "SD",  "CHC", 3, "SD",
+  "ALDS",         "CLE", "CWS", 5, "CLE",
+  "ALDS",         "TB",  "NYY", 5, "TB",
+  "NLDS",         "LAD", "ATL", 5, "LAD",
+  "NLDS",         "MIL", "SD",  5, "MIL",
+  "ALCS",         "TB",  "CLE", 7, "TB",
+  "NLCS",         "MIL", "LAD", 7, "MIL",
+  "World Series", "MIL", "TB",  7, "MIL"
+) |>
+  rowwise() |>
+  mutate(p_high   = series_prob(high_seed, low_seed, best_of),
+         high_won = winner == high_seed,
+         p_winner = ifelse(high_won, p_high, 1 - p_high)) |>
+  ungroup()
+
+scores <- actual |>
+  summarise(brier    = mean((p_high - high_won)^2),
+            log_loss = -mean(log(p_winner)),
+            fav_won  = sum(p_winner > 0.5),
+            n        = n())
+```
+
+## 4. Results
+
+#### 4.1 Team Strength
+
+Each playoff team is rated by its expected runs scored and its expected runs allowed per nine innings, each measured against a league-average opponent. Teams that score more and allow fewer runs are the strongest by this measure.
+
+```{r team-ratings}
+# Team ratings: runs per 9 innings vs a league-average opponent
+ratings <- tibble(team = c(AL, NL), league = rep(c("AL", "NL"), each = 6)) |>
+  mutate(
+    runs_scored  = map_dbl(team, \(t) 9 * expected_runs(t, "LG")[["0.000"]]),
+    runs_allowed = map_dbl(team, \(t) 9 * expected_runs("LG", t)[["0.000"]]),
+    name = team_names[team]
+  )
+```
+
+```{r fig-ratings}
+#| fig-cap: "Expected runs scored and allowed per nine innings against a league-average opponent, from each team's Markov chain. Better teams are toward the bottom right."
+ggplot(ratings, aes(runs_scored, runs_allowed, color = league)) +
+  geom_point(size = 3) +
+  geom_text(aes(label = name), vjust = -0.9, size = 3.2, show.legend = FALSE) +
+  scale_y_reverse() +
+  scale_color_manual(values = c(AL = "#C8102E", NL = "#002D72")) +
+  labs(x = "Runs scored per 9 innings", y = "Runs allowed per 9 innings (reversed)",
+       color = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "top")
+```
+
+Because both measures are taken against a league-average opponent, they separate offense from pitching: a team can be strong because of a powerful lineup, a stingy pitching staff, or both. The ratings capture run production only, so they can differ from win-loss records, which also reflect luck, bullpen usage, and clutch performance, none of which the chain sees. Because every team's rates are shrunk toward the league average, the spread between teams is modest, and the simulation will rarely treat any playoff team as a lopsided favorite.
+
+#### 4.2 Pre-postseason championship odds
+
+Across 10,000 simulated postseasons, the model gives each team a probability of winning its pennant and of winning the World Series.
+
+Two structural features shape these probabilities. The top two seeds in each league skip the Wild Card round, so they must win one fewer series. And series length matters: suppose a team has a 55% chance of winning any single game. Its chance of winning a best-of-three is about 57%, a best-of-five about 59%, and a best-of-seven about 61%. A modest per-game edge becomes only a slightly larger series edge, which is why individual series probabilities sit close to 50% and why even the strongest team's championship probability is usually modest, since it must win several series in a row.
+
+```{r fig-odds}
+#| fig-cap: "Simulated probability of winning the pennant and the World Series (10,000 simulated postseasons)."
+results |>
+  mutate(name = paste0(team_names[team], " (", league, " ", seed, ")"),
+         name = factor(name, levels = rev(name))) |>
+  pivot_longer(c(p_pennant, p_title), names_to = "event", values_to = "p") |>
+  mutate(event = recode(event, p_pennant = "Win pennant", p_title = "Win World Series")) |>
+  ggplot(aes(p, name, fill = event)) +
+  geom_col(position = position_dodge(width = 0.75), width = 0.7) +
+  scale_x_continuous(labels = scales::percent) +
+  scale_fill_manual(values = c("Win pennant" = "#9DB4D3", "Win World Series" = "#002D72")) +
+  labs(x = NULL, y = NULL, fill = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "top")
+```
+
+```{r tbl-odds}
+results |>
+  mutate(Team = team_names[team], League = league, Seed = seed,
+         Record = paste0(wins_2026[team], "-", 162 - wins_2026[team]),
+         `P(pennant)` = pct(p_pennant, 1), `P(title)` = pct(p_title, 1)) |>
+  select(Team, League, Seed, Record, `P(pennant)`, `P(title)`) |>
+  kable(caption = "Simulated pennant and World Series probabilities, sorted by title odds.")
+```
+
+#### 4.3 Model probabilities for each series
+
+Our model went `r scores$fav_won`-for-`r scores$n` (`r pct(scores$fav_won / scores$n, 1)`) on correctly predicting the series winner for each matchup. Its Brier score was `r round(scores$brier, 3)` (compared with 0.25 for always guessing 50/50), and its log loss was `r round(scores$log_loss, 3)`. Seedings in the MLB Playoffs are not always accurate based on how well a team performed throughout the regular season. For example, the 6-seeded White Sox finished the regular season with a better record than the 3-seeded Astros, but were a lesser seed due to finishing second in their division behind the Guardians.
+
+The model tended to favor teams with elite hitting or pitching, like the Cubs and Yankees, but failed to properly account for their lack of the other.
+
+```{r tbl-series}
+actual |>
+  mutate(Matchup = paste0(team_names[high_seed], " vs. ", team_names[low_seed]),
+         Winner = team_names[winner],
+         `P(higher seed)` = pct(p_high, 1),
+         `P(actual winner)` = pct(p_winner, 1)) |>
+  select(Round = round, Matchup, Winner, `P(higher seed)`, `P(actual winner)`) |>
+  kable(caption = "Model probabilities for every 2026 postseason series. The first team listed had home-field advantage.")
+```
+
+```{r fig-series}
+#| fig-cap: "Model probability assigned to the team that actually won each series. Points right of the dashed line were correctly favored."
+actual |>
+  mutate(label = paste0(round, ": ", team_names[winner], " over ",
+                        team_names[ifelse(high_won, low_seed, high_seed)]),
+         label = factor(label, levels = rev(label)),
+         correct = ifelse(p_winner > 0.5, "Model favorite won", "Upset (by model)")) |>
+  ggplot(aes(p_winner, label, color = correct)) +
+  geom_vline(xintercept = 0.5, linetype = "dashed", color = "grey50") +
+  geom_point(size = 3) +
+  scale_x_continuous(labels = scales::percent) +
+  expand_limits(x = c(0.3, 0.8)) +
+  scale_color_manual(values = c("Model favorite won" = "#002D72", "Upset (by model)" = "#C8102E")) +
+  labs(x = "Model probability for the actual winner", y = NULL, color = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "top")
+```
+
+## 5. Limitations
+
+-   Shared advancement rules: Teams differ only in outcome frequencies. In reality, speed, baserunning aggression, and defense change how runners advance, and our proposal anticipated team-specific matrices. Adding partial pooling (team-specific advancement shrunk toward the league) would be a natural extension.
+
+-   No home-field advantage: The model's game probability is built from run production alone, and the same team ratings are used at home and on the road. As far as we can tell from the code, the home and road probabilities for a pairing are therefore essentially identical, so the home-field schedule affects who plays where but not the win probabilities. Real home-field effects are small but not zero, and an adjustment could be estimated from the regular-season data.
+
+-   Regular-season rates in the postseason: Playoff opponents are better than average, and postseason teams lean on their best starters and relievers, none of which the model captures. Rates were also not adjusted for opponent quality during the season.
+
+-   No lineup, starter, or injury information: Each team is treated as one fixed offense and one fixed pitching staff for every game of a series.
+
+## 6. Conclusion
+
+We built a baseball-specific simulation in which each half-inning is an absorbing Markov chain over 24 base-out states, with team-specific outcome rates combined for every matchup, and we used it to estimate every 2026 playoff team's chances before the postseason began. Game probabilities are computed exactly and then chained into series and the full bracket across 10,000 simulations.
+
+The model gives a transparent, reproducible way to turn regular-season data into postseason probabilities, and the scores in Sections 4.2 and 4.3 measure such. Because only 11 series were played, those scores are a rough check on the approach, not proof of how well it forecasts in general.
